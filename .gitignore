@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.parquet
+*.png
+data_storage/cache/
+.vibe-safe/
+.pytest_cache/
+C
+CLINE_LOG.md_temp
