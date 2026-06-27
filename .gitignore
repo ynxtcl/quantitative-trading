@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.parquet
+*.csv
+.pytest_cache/
+.vibe-safe/
