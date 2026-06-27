@@ -1,0 +1,4 @@
+"""Strategy configs"""
+TREND_FOLLOWING_CONFIG = {"name":"trend_following","weight":0.50,"entry_period":20,"exit_period":10,"ma_filter_period":60,"adx_threshold":20,"position_weight":1.0}
+MEAN_REVERSION_CONFIG = {"name":"mean_reversion","weight":0.10,"bb_period":20,"bb_std":2.0,"rsi_period":14,"rsi_oversold":30,"rsi_overbought":70,"trend_filter":True,"trend_filter_level":0.97,"min_bb_width":0.05,"max_bb_width":0.20,"volume_filter":True,"vol_low_threshold":0.8,"vol_high_threshold":2.0,"atr_period":14,"stop_loss_atr":1.5,"position_weight":0.5}
+FACTOR_SELECTION_CONFIG = {"name":"factor_selection","weight":0.40,"rebalance_freq":"monthly","top_n":10,"factors":[{"name":"pe","weight":0.20,"direction":-1},{"name":"roe","weight":0.25,"direction":1},{"name":"momentum_1m","weight":0.20,"direction":1},{"name":"volume_ratio","weight":0.15,"direction":1},{"name":"volatility","weight":0.20,"direction":-1}],"score_method":"equal_weight"}
