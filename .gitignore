@@ -3,6 +3,9 @@ __pycache__/
 .vscode/
 .idea/
 *.parquet
-*.csv
-.pytest_cache/
+*.png
+data_storage/cache/
 .vibe-safe/
+.pytest_cache/
+C
+CLINE_LOG.md_temp
