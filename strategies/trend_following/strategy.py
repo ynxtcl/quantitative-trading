@@ -62,7 +62,19 @@ class TrendFollowingStrategy(BaseStrategy):
         # 成交量均线（参考备用）
         df['volume_ma'] = df['volume'].rolling(20).mean()
 
+        # ============ 分阶段止盈指标 (Step A) ============
+        if self.config.get('take_profit_enabled', False):
+            tp_lookback = self.config.get('take_profit_lookback', 10)
+            # 最近N日最高点，不含当日（shift(1)防未来泄漏）
+            df['tp_high_max'] = df['high'].rolling(tp_lookback).max().shift(1)
+            # 从高点回撤比例 = (tp_high_max - close) / tp_high_max
+            df['tp_drawdown'] = (df['tp_high_max'] - df['close']) / df['tp_high_max']
+        else:
+            df['tp_high_max'] = np.nan
+            df['tp_drawdown'] = np.nan
+
         return df
+
 
     def generate_signals(self, data: pd.DataFrame) -> List[Signal]:
         signals = []
@@ -86,17 +98,48 @@ class TrendFollowingStrategy(BaseStrategy):
 
         if buy_cond:
             confidence = min(current['adx'] / 50.0, 1.0)
+
+            # ---- ATR 动态仓位控制 (2026-07-01 新增) ----
+            # 当 close/atr < threshold 时，按比例缩减仓位
+            # 高波动时自动减仓，避免被震出场
+            base_weight = self.config.get('position_weight', 1.0)
+            if self.config.get('use_atr_sizing', False) and current.get('atr', 0) > 0:
+                atr_threshold = self.config.get('atr_sizing_threshold', 12)
+                close_atr_ratio = current['close'] / current['atr']
+                if close_atr_ratio < atr_threshold:
+                    # 线性缩减：close/atr=12 → weight*100%, =6 → weight*50%
+                    sizing_factor = close_atr_ratio / atr_threshold
+                    base_weight *= max(sizing_factor, 0.3)  # 最低保留30%
+
             signals.append(Signal(
                 symbol=self.symbol,
                 direction=1,
-                weight=self.config.get('position_weight', 1.0),
+                weight=base_weight,
                 price=current['close'],
                 confidence=round(confidence, 2),
                 strategy='trend_following',
                 timestamp=current_date
             ))
 
-        # ────── 卖出/平仓条件 ──────
+        # ────── 分阶段止盈 (Step A: 2026-07-01) ──────
+        # 从最近10日高点回落>8% → 平掉一半仓位锁定利润
+        # 剩余仓位继续按原规则奔跑，不错过后面的趋势
+        if self.config.get('take_profit_enabled', False) \
+                and not pd.isna(current.get('tp_drawdown', np.nan)):
+            tp_drawdown_threshold = self.config.get('take_profit_drawdown', 0.08)
+            tp_exit_ratio = self.config.get('take_profit_exit_ratio', 0.5)
+            if current['tp_drawdown'] > tp_drawdown_threshold:
+                signals.append(Signal(
+                    symbol=self.symbol,
+                    direction=-1,
+                    weight=tp_exit_ratio,
+                    price=current['close'],
+                    confidence=0.7,          # 略低于通道退出的0.8
+                    strategy='trend_following',
+                    timestamp=current_date
+                ))
+
+        # ────── 卖出/平仓条件（通道跌破 = 趋势反转）──────
         sell_cond = (
             current['low'] < current['low_min']
         )
@@ -111,6 +154,7 @@ class TrendFollowingStrategy(BaseStrategy):
                 strategy='trend_following',
                 timestamp=current_date
             ))
+
 
         return signals
 

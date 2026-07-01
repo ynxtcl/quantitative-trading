@@ -731,11 +731,17 @@ python -m ops.scheduler list
 
 ---
 
-### 调整 A：趋势跟踪 — 分阶段止盈（降低回撤）
+### 调整 A：趋势跟踪 — 分阶段止盈（降低回撤）✅ 已实现
 
 **问题**：TF 目前只有通道跌破出场（exit_period=20），没有主动止盈。2022年单边下跌中，TF 持仓从浮盈→浮亏，坐了完整过山车。
 
 **方案**：当持仓期间价格从 10 日高点回落 >8% 时，平掉 **一半仓位** 锁定利润。剩余仓位继续按原规则奔跑。
+
+**变更文件**：
+| 文件 | 变更 |
+|:---|:---|
+| `config/strategy_config.py` | 新增 take_profit_* 4个参数 |
+| `strategies/trend_following/strategy.py` | calculate_indicators() 新增 tp_high_max/tp_drawdown；generate_signals() 新增止盈卖出信号分支 |
 
 | 参数 | 当前值 | 计划值 | 预期影响 |
 |:---|:---:|:---:|:---|
@@ -745,6 +751,9 @@ python -m ops.scheduler list
 | `take_profit_exit_ratio` | — | **0.5** | 平掉一半仓位 |
 
 **预期**：夏普 +0.05~0.08，回撤 -3~5pp
+
+**执行逻辑**：止盈信号(direction=-1, weight=0.5) 由引擎 `_execute_signal` 执行 → `sell_qty = int(positions[sym] * 0.5)` → 只平一半。当天若同时触发通道跌破(direction=-1, weight=1.0)，组合器净权重叠加即可。多次连续触发止盈形成几何衰减（50%→25%→12.5%→...），不反弹则持续减仓。
+
 
 ---
 
