@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ========================================
- 策略独立年化评估 — 用于数据驱动定权重
+  策略独立年化评估 — 用于数据驱动定权重
 ========================================
 
 【为什么要做独立评估？】
@@ -10,6 +10,11 @@
 
 【输出】
 每个策略的独立年化收益率 → 按年化比例算权重
+
+【2026-07-01 BUGFIX: PE/ROE 数据加载】
+之前的因子选股独立评估中，PE/ROE 因子始终返回 0.5（中性值），
+导致所有股票得分相同 → 选股退化为随机选择。
+现修复：通过 DataLoader.load_valuation() + load_financial() 加载真实数据。
 """
 import sys, os
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +39,7 @@ from portfolio.engine import PortfolioEngine
 from backtest.portfolio_reporter import PortfolioReporter
 
 import warnings
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 
@@ -55,6 +61,59 @@ def run_single_strategy(data_dict: dict, label: str,
         risk_manager=None,  # 单策略不需要组合风控
     )
     return result
+
+
+def load_valuation_data(loader: DataLoader, symbols: list) -> dict:
+    """
+    加载并合并所有股票的估值/财务因子数据
+    
+    与 main_portfolio.py 中的 load_valuation_data() 逻辑一致
+    
+    返回:
+        {symbol: DataFrame} — 包含 OHLCV + pe + roe 列的日频数据
+    """
+    print("\n  [加载估值/财务数据]")
+    
+    enriched_data = {}
+    
+    for sym in symbols:
+        df_daily = loader.load_daily(sym, 
+                                      start=BACKTEST_CONFIG['start_date'],
+                                      end=BACKTEST_CONFIG['end_date'])
+        if df_daily.empty:
+            continue
+        
+        df_daily = clean_daily_data(df_daily)
+        
+        # 1. PE/PB 估值数据（百度股市通）
+        val_df = loader.load_valuation(sym)
+        if not val_df.empty:
+            df_daily = DataLoader.merge_valuation(df_daily, val_df)
+            if 'pe_ttm' in df_daily.columns:
+                df_daily = df_daily.rename(columns={'pe_ttm': 'pe'})
+        else:
+            df_daily['pe'] = 0.5
+        
+        if 'pb' not in df_daily.columns:
+            df_daily['pb'] = 0.5
+        
+        # 2. ROE 财务数据（东方财富）
+        fin_df = loader.load_financial(sym)
+        if not fin_df.empty:
+            extracted = DataLoader._extract_pe_roe_from_financial(fin_df)
+            if not extracted.empty and 'roe' in extracted.columns:
+                fin_roe = extracted[['date', 'roe']].copy()
+                df_with_roe = pd.merge(df_daily, fin_roe, on='date', how='left')
+                df_with_roe['roe'] = df_with_roe['roe'].ffill().fillna(0.5)
+                df_daily = df_with_roe
+            else:
+                df_daily['roe'] = 0.5
+        else:
+            df_daily['roe'] = 0.5
+        
+        enriched_data[sym] = df_daily
+    
+    return enriched_data
 
 
 def main():
@@ -94,7 +153,8 @@ def main():
         cfg['symbol'] = sym
         mr_strategies[sym] = MeanReversionStrategy('mean_reversion', cfg)
 
-    # 因子选股
+    # 因子选股 — 需加载带 PE/ROE 的数据
+    enriched_data = load_valuation_data(loader, symbols)
     rebalancer = FactorRebalancer(FACTOR_SELECTION_CONFIG)
 
     # ============ 逐个策略独立回测 ============
@@ -135,7 +195,8 @@ def main():
     print(f"\n{'─' * 50}")
     print("  [3/3] 因子选股（独立运行）")
     print(f"{'─' * 50}")
-    r = run_single_strategy(cleaned_data, 'FS',
+    # ★ 使用 enriched_data（含 PE/ROE 列）进行因子选股独立评估
+    r = run_single_strategy(enriched_data, 'FS',
                             rebalancer=rebalancer)
     results['factor_selection'] = {
         'final': r.final_value(),

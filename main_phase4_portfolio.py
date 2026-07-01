@@ -78,6 +78,66 @@ from models.model_trainer import train_model, print_training_summary
 #  辅助函数
 # ========================
 
+def load_valuation_data(loader: DataLoader, symbols: list) -> dict:
+    """
+    加载并合并所有股票的估值/财务因子数据
+
+    返回:
+        {symbol: DataFrame} — 包含 OHLCV + pe + roe 列的日频数据
+
+    注意：与 main_portfolio.py 中的 load_valuation_data() 逻辑一致，
+    因为 DataLoader.load_daily() 有网络缓存，多次调用不会显著增加耗时。
+    """
+    import pandas as pd
+    print("\n[Step 1.5] 加载财务与估值数据（用于因子选股）")
+
+    enriched_data = {}
+
+    for sym in symbols:
+        df_daily = loader.load_daily(sym,
+                                      start=BACKTEST_CONFIG['start_date'],
+                                      end=BACKTEST_CONFIG['end_date'])
+        if df_daily.empty:
+            continue
+
+        df_daily = clean_daily_data(df_daily)
+
+        # 1. 加载日频 PE/PB 估值数据（百度股市通）
+        val_df = loader.load_valuation(sym)
+        if not val_df.empty:
+            df_daily = DataLoader.merge_valuation(df_daily, val_df)
+            if 'pe_ttm' in df_daily.columns:
+                df_daily = df_daily.rename(columns={'pe_ttm': 'pe'})
+        else:
+            df_daily['pe'] = 0.5
+            print(f"  [WARN] {sym}: 无估值数据，PE=0.5")
+
+        if 'pb' not in df_daily.columns:
+            df_daily['pb'] = 0.5
+
+        # 2. 加载季度 ROE 财务数据（东方财富）
+        fin_df = loader.load_financial(sym)
+        if not fin_df.empty:
+            extracted = DataLoader._extract_pe_roe_from_financial(fin_df)
+            if not extracted.empty and 'roe' in extracted.columns:
+                fin_roe = extracted[['date', 'roe']].copy()
+                df_with_roe = pd.merge(df_daily, fin_roe, on='date', how='left')
+                df_with_roe['roe'] = df_with_roe['roe'].ffill().fillna(0.5)
+                df_daily = df_with_roe
+                print(f"  [OK] {sym}: ROE 合并完成")
+            else:
+                df_daily['roe'] = 0.5
+                print(f"  [WARN] {sym}: 无 ROE 数据，ROE=0.5")
+        else:
+            df_daily['roe'] = 0.5
+            print(f"  [WARN] {sym}: 无财务数据，ROE=0.5")
+
+        enriched_data[sym] = df_daily
+        print(f"  [OK] {sym}: {len(df_daily)} 行数据，含 pe/roe 因子列")
+
+    return enriched_data
+
+
 def make_xgb_factory(symbol: str):
     """
     XGBoost 策略工厂——用于训练后创建推理实例
@@ -360,10 +420,28 @@ def main():
     print(f"  [Step 6] 运行组合回测（含 XGBoost ML 信号）")
     print(f"{'=' * 65}")
 
-    # 数据清洗
+    # ★ 2026-07-01 BUGFIX: 加载含 PE/ROE 的估值/财务因子数据
+    #   之前 data_dict=cleaned_data（纯 OHLCV）传递给引擎，
+    #   rebalancer._calc_factor() 对 pe/roe 返回 0.5（中性值），
+    #   导致因子选股退化为随机选择。
+    #   现在使用 enriched_data（含 pe/roe 列）替代 cleaned_data。
+    print(f"\n{'=' * 65}")
+    print(f"  [Step 6a] 加载 PE/ROE 因子数据")  
+    print(f"{'=' * 65}")
+    enriched_data = load_valuation_data(loader, symbols)
+
+    # 数据清洗（未加载估值数据的股票用原始清洗数据兜底）
     cleaned_data = {}
     for sym, df in raw_data.items():
         cleaned_data[sym] = clean_daily_data(df)
+
+    # 用 enriched_data 替换 cleaned_data（含 pe/roe 列）
+    data_for_engine = {}
+    for sym in symbols:
+        if sym in enriched_data:
+            data_for_engine[sym] = enriched_data[sym]
+        elif sym in cleaned_data:
+            data_for_engine[sym] = cleaned_data[sym]
 
     # XGBoost 数据源：预计算特征的 DataFrame
     xgb_data = {}
@@ -372,7 +450,7 @@ def main():
             xgb_data[sym] = fe_data_dict[sym]
 
     result = engine.run(
-        data_dict=cleaned_data,
+        data_dict=data_for_engine,
         tf_strategies=tf_strategies,
         mr_strategies=mr_strategies,
         rebalancer=rebalancer,

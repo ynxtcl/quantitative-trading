@@ -14,6 +14,9 @@
 【设计架构】
 main_portfolio.py
   ├─ DataLoader（数据加载）
+  │   ├─ load_daily → 日K线
+  │   ├─ load_valuation → PE/PB 日频数据（百度股市通）
+  │   └─ load_financial → ROE 季度数据（东方财富）
   ├─ DataCleaner（数据清洗）
   ├─ 各策略 WF 验证（独立检查过拟合）
   │   ├─ TrendFollowingStrategy → WF for each stock
@@ -56,6 +59,7 @@ from backtest.walk_forward import WalkForwardValidator
 from backtest.portfolio_reporter import PortfolioReporter
 
 import warnings
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 
@@ -136,6 +140,64 @@ def run_strategy_wf(data_dict: dict, factory_fn, label: str):
     return results
 
 
+def load_valuation_data(loader: DataLoader, symbols: list) -> dict:
+    """
+    加载并合并所有股票的估值/财务因子数据
+    
+    返回:
+        {symbol: DataFrame} — 包含 OHLCV + pe + roe 列的日频数据
+    """
+    print("\n[Step 1.5] 加载财务与估值数据（用于因子选股）")
+    
+    # 为每只股票加载估值和财务数据
+    enriched_data = {}
+    
+    for sym in symbols:
+        df_daily = loader.load_daily(sym, 
+                                      start=BACKTEST_CONFIG['start_date'],
+                                      end=BACKTEST_CONFIG['end_date'])
+        if df_daily.empty:
+            continue
+        
+        df_daily = clean_daily_data(df_daily)
+        
+        # 1. 加载日频 PE/PB 估值数据（百度股市通）
+        val_df = loader.load_valuation(sym)
+        if not val_df.empty:
+            df_daily = DataLoader.merge_valuation(df_daily, val_df)
+            # 重命名 pe_ttm → pe 以匹配 factor_rebalancer 期望的列名
+            if 'pe_ttm' in df_daily.columns:
+                df_daily = df_daily.rename(columns={'pe_ttm': 'pe'})
+        else:
+            df_daily['pe'] = 0.5
+            print(f"  [WARN] {sym}: 无估值数据，PE=0.5")
+        
+        if 'pb' not in df_daily.columns:
+            df_daily['pb'] = 0.5
+        
+        # 2. 加载季度 ROE 财务数据（东方财富）
+        fin_df = loader.load_financial(sym)
+        if not fin_df.empty:
+            extracted = DataLoader._extract_pe_roe_from_financial(fin_df)
+            if not extracted.empty and 'roe' in extracted.columns:
+                fin_roe = extracted[['date', 'roe']].copy()
+                df_with_roe = pd.merge(df_daily, fin_roe, on='date', how='left')
+                df_with_roe['roe'] = df_with_roe['roe'].ffill().fillna(0.5)
+                df_daily = df_with_roe
+                print(f"  [OK] {sym}: ROE 合并完成")
+            else:
+                df_daily['roe'] = 0.5
+                print(f"  [WARN] {sym}: 无 ROE 数据，ROE=0.5")
+        else:
+            df_daily['roe'] = 0.5
+            print(f"  [WARN] {sym}: 无财务数据，ROE=0.5")
+        
+        enriched_data[sym] = df_daily
+        print(f"  [OK] {sym}: {len(df_daily)} 行数据，含 pe/roe 因子列")
+    
+    return enriched_data
+
+
 # ========================
 #  主入口
 # ========================
@@ -143,12 +205,12 @@ def run_strategy_wf(data_dict: dict, factory_fn, label: str):
 def main():
     print("=" * 65)
     print("  定量交易系统 — Phase 2：多策略组合回测")
-    print("  策略：趋势跟踪(40%) + 均值回归(20%) + 因子选股(40%)")
+    print("  策略：趋势跟踪(35%) + 均值回归(25%) + 因子选股(40%)")
     print("  标的：A股10只（银行/家电/白酒/科技/新能源/保险/化工）")
     print("=" * 65)
 
     # ============ 1. 数据加载 ============
-    print("\n[Step 1] 加载数据")
+    print("\n[Step 1] 加载日K线数据")
     loader = DataLoader()
     symbols = DEFAULT_SYMBOLS
     data_dict = loader.load_multiple(
@@ -158,6 +220,16 @@ def main():
     )
     if not data_dict:
         print("数据加载失败")
+        return
+
+    # ============ 1.5 加载估值 + 财务因子数据 ============
+    # ★ 2026-07-01 BUGFIX: 因子选股依赖的 PE/ROE 从未被加载
+    #   之前 FactorRebalancer._calc_factor() 对 pe/roe 返回 0.5（中性）
+    #   导致所有股票得分相同 → 选股退化为随机选择
+    #   现在加载百度股市通日频 PE/PB + 东方财富季度 ROE
+    enriched_data = load_valuation_data(loader, symbols)
+    if not enriched_data:
+        print("估值数据加载失败")
         return
 
     # ============ 2. 各策略独立 WF 验证 ============
@@ -240,13 +312,11 @@ def main():
     print(f"  # Step 4: 运行组合回测")
     print(f"{'#' * 65}")
 
-    # 数据清洗
-    cleaned_data = {}
-    for sym, df in data_dict.items():
-        cleaned_data[sym] = clean_daily_data(df)
-
+    # ★ 使用 enriched_data（含 PE/ROE 列）传递给引擎
+    #   engine.run() 内部将 data_dict 传给 rebalancer.generate_rebalance_signals()
+    #   rebalancer._calc_factor() 会在每只股票的 df 中查找 'pe'/'roe' 列
     result = engine.run(
-        data_dict=cleaned_data,
+        data_dict=enriched_data,
         tf_strategies=tf_strategies,
         mr_strategies=mr_strategies,
         rebalancer=rebalancer,

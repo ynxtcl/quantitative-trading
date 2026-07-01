@@ -182,9 +182,32 @@ class FactorRebalancer:
                 return None
 
             elif fname in ['pe', 'roe']:
-                # 财务因子：若 DataFrame 中有对应列则用，否则从 akshare 加载
+                # 财务因子：若 DataFrame 中有对应列则用，否则从 DataLoader 加载
                 if fname in df.columns:
                     return last_row[fname]
+                # 尝试从估值数据源加载（通过 pe_ttm 计算 PE 或取 ROE）
+                pe_ttm_col = 'pe_ttm'
+                if pe_ttm_col in df.columns:
+                    latest = df[pe_ttm_col].dropna()
+                    if not latest.empty:
+                        if fname == 'pe':
+                            return latest.iloc[-1]
+                        elif fname == 'roe':
+                            # ROE 近似 = 1 / PE (反向推导，仅当无 ROE 数据时)
+                            # 更准确的做法需要 load_financial()，这里作为后备
+                            return 1.0 / max(latest.iloc[-1], 0.01)
+                # 最终回退：通过 DataLoader 加载财务数据
+                try:
+                    from data.loader import DataLoader
+                    loader = DataLoader()
+                    fin_df = loader.load_financial(last_row.get('symbol', ''))
+                    if not fin_df.empty:
+                        if fname == 'roe':
+                            roe_df = loader._extract_pe_roe_from_financial(fin_df)
+                            if not roe_df.empty and 'roe' in roe_df.columns:
+                                return float(roe_df['roe'].dropna().iloc[-1])
+                except Exception:
+                    pass
                 # 对于没有财务数据的场景，返回 0.5（中性分）
                 return 0.5
 
