@@ -10,6 +10,18 @@ data_storage/cache/
 C
 CLINE_LOG.md_temp
 
+# Debug/temp scripts (one-off investigations)
+diagnose_api.py
+diagnose_financial.py
+find_pe_api.py
+final_pe_test.py
+test_api_pe.py
+test_pe_source.py
+verify_fix.py
+
+# Output files
+*_output.txt
+
 # Ops Layer
 logs/
 data_storage/quant_trading.db
