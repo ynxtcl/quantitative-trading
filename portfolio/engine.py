@@ -220,6 +220,22 @@ class PortfolioEngine:
                 'xgboost': [],
             }
 
+            # ---- 前置计算：全市场中位数回报率（C: MR动态仓位用）----
+            # 必须在策略信号生成之前计算，以便注入MR策略
+            all_returns_20d = []
+            for sym in symbols:
+                df_sym = aligned[sym]
+                if current_date not in df_sym.index:
+                    continue
+                idx = df_sym.index.get_loc(current_date)
+                if idx >= 20:
+                    price_today = float(df_sym.iloc[idx]['close'])
+                    price_20d_ago = float(df_sym.iloc[idx - 20]['close'])
+                    if price_20d_ago > 0:
+                        ret_20d = (price_today - price_20d_ago) / price_20d_ago
+                        all_returns_20d.append(ret_20d)
+            market_median_return = float(np.median(all_returns_20d)) if all_returns_20d else 0.0
+
             # ---- 运行择时策略（TF + MR）- 跳过空的策略字典 ----
             for sym in symbols:
                 df = aligned[sym]
@@ -239,7 +255,9 @@ class PortfolioEngine:
                         strategies_signals['trend_following'].extend(tf_sigs)
 
                     # 均值回归（跳过空字典=不启用）
+                    # 注入市场状态用于动态仓位调整（调整 C: 2026-07-01）
                     if mr_strategies and sym in mr_strategies:
+                        mr_strategies[sym].market_median_return = market_median_return
                         mr_sigs = mr_strategies[sym].run(bar)
                         strategies_signals['mean_reversion'].extend(mr_sigs)
 
@@ -284,25 +302,6 @@ class PortfolioEngine:
             current_value = self.capital + total_position_value
             self.peak_value = max(self.peak_value, current_value)
             current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
-
-            # ---- 计算所有持仓股票的20日中位数回报率（用于广谱下跌过滤器）----
-            market_median_return = 0.0
-            if len(self.daily_records) >= 20:
-                # 收集每只有持仓的股票的20日回报率
-                all_returns_20d = []
-                for sym in symbols:
-                    if sym in aligned and sym in current_prices and current_prices[sym] > 0:
-                        df_sym = aligned[sym]
-                        idx = df_sym.index.get_loc(current_date) if current_date in df_sym.index else -1
-                        if idx >= 20:
-                            price_today = float(df_sym.iloc[idx]['close'])
-                            price_20d_ago = float(df_sym.iloc[idx - 20]['close'])
-                            if price_20d_ago > 0:
-                                ret_20d = (price_today - price_20d_ago) / price_20d_ago
-                                all_returns_20d.append(ret_20d)
-                if all_returns_20d:
-                    import numpy as np
-                    market_median_return = float(np.median(all_returns_20d))
 
             # ---- B1: 组合级止损检查（在风控过滤之前执行） ----
             # 强制平仓信号优先于普通信号，确保亏损头寸及时了结

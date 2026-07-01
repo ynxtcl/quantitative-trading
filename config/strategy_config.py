@@ -54,6 +54,14 @@ TREND_FOLLOWING_CONFIG = {
     # 因为趋势信号本身就包含了对方向的强烈判断
     # 注意：这是信号权重，实际仓位还会被引擎的可用资金限制
 
+    # ★ EMA20 辅助过滤 (2026-07-01 Step B) ★
+    "ema_filter_enabled": True,        # 启用 EMA20 辅助过滤（Step B）
+    "ema_filter_period": 20,           # EMA20 周期
+    # 问题：MA60 反应太慢（~3个月均线），2022年下跌中逆势开仓
+    # 方案：当 close < EMA20 时，即使 ADX>25 也不开新仓
+    # EMA20 反应快，可在下跌初期阻止逆势开仓
+    # 预期：回撤 -3~5pp，信号数量 ~-15%，夏普基本不变
+
     # ★ ATR 动态仓位控制 (2026-07-01) ★
     "use_atr_sizing": True,         # 是否启用 ATR 动态仓位
     "atr_sizing_threshold": 12,     # ATR比例阈值：close/atr < 12 时缩减仓位
@@ -144,6 +152,18 @@ MEAN_REVERSION_CONFIG = {
     # 原0.5：过于保守，即使入场也只敢用一半资金
     # 新0.7：更充分地利用回归信号，同时保留30%的缓冲
     # 预期：MR单笔盈利贡献提升
+
+    # ★ 市场状态动态仓位 (2026-07-01 调整 C) ★
+    "market_adaptive_weight": False,    # 是否启用市场状态自适应（默认关闭，保持旧行为）
+    # 开通后 MR 买入信号会根据 market_median_return 自动缩仓：
+    #   普跌(mmr<-3%) → 缩至 weak_market_weight
+    #   严重(mmr<-8%) → 缩至 severe_market_weight
+    # 原理：市场普跌时 MR 做多 = 接飞刀
+    # 当前默认 False，确认效果后再永久启用
+    "weak_market_threshold": -0.03,     # 弱势市场阈值：全市场20日中位数回报 < -3%
+    "severe_market_threshold": -0.08,   # 严重弱势阈值：全市场20日中位数回报 < -8%
+    "weak_market_weight": 0.3,          # 弱势市场信号仓位保留 30%
+    "severe_market_weight": 0.15,       # 严重弱势市场信号仓位保留 15%
 }
 
 # ==================== 策略C：因子选股 ====================
@@ -175,13 +195,15 @@ FACTOR_SELECTION_CONFIG = {
         # 但要注意：低PE可能是"价值陷阱"（公司基本面恶化的假象）
         # 所以权重只给20%，不单独依赖
 
-        {"name": "roe", "weight": 0.25, "direction": 1},
+        {"name": "roe", "weight": 0.30, "direction": 1},
         # ROE（净资产收益率）：越高越好（盈利能力）
         # ROE ≥ 15%是大牛股的典型特征（茅台常年30%+）
-        # 给最高权重25%，因为ROE是预测未来收益最稳定的单一因子
+        # 给最高权重30%（Step D: 自25%提升），因为ROE是预测未来收益最稳定的单一因子
 
-        {"name": "momentum_1m", "weight": 0.20, "direction": 1},
+        {"name": "momentum_1m", "weight": 0.10, "direction": 1},
         # 动量因子：近1月涨幅越高越好
+        # Step D: 权重自0.20降至0.10
+        # 原因是动量是顺周期因子，熊市中追跌，回撤贡献大
         # 动量效应的心理学基础：
         #   1. 锚定效应 — 投资者对新信息反应不足
         #   2. 羊群效应 — 趋势形成后自我强化
@@ -192,8 +214,9 @@ FACTOR_SELECTION_CONFIG = {
         # 价量关系：放量上涨 = 资金流入，缩量上涨 = 动能不足
         # 权重最低15%，因为量比不稳定，单日异常值多
 
-        {"name": "volatility", "weight": 0.20, "direction": -1},
+        {"name": "volatility", "weight": 0.25, "direction": -1},
         # 波动率因子：越低越好（低波动异象）
+        # Step D: 权重自0.20升至0.25，强化熊市防御
         # 学术研究发现：低波动股票长期回报反而高于高波动股票
         # 这就是著名的"低波动异象"（Low Volatility Anomaly）
         # 可能的解释：高波动股票被散户追捧（彩票偏好），估值过高

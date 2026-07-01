@@ -70,9 +70,12 @@ class FactorSelectionStrategy(BaseStrategy):
         输入：包含 PE/ROE 等财务列的 DataFrame（多只股票合并的宽表）
         输出：带因子分数列的 DataFrame
 
-        当前简化实现：
-        - 如果输入是单股票数据（只有 OHLCV），则自动从价格派生因子
-        - 在实际应用中，财务因子需要从外部数据源（同花顺/东方财富）获取
+        当前实现：
+        - 非财务因子（动量/量比/波动率）：直接从价格数据派生
+        - PE因子：优先使用 pe_ttm 列（来自 DataLoader.load_valuation()），
+          然后反归一化为截面排名（PE方向=-1，低PE得分高）
+        - ROE因子：优先使用 roe 列，无则通过 pe_ttm 近似估算
+          (ROE ≈ 1/PE，仅作为近似兜底)
         """
         df = data.copy()
 
@@ -100,20 +103,37 @@ class FactorSelectionStrategy(BaseStrategy):
                 df['volatility'] = df['close'].pct_change().rolling(20).std()
                 df[score_col] = df['volatility'].rank(pct=True)
 
-            elif fname in ['pe', 'roe'] and fname in df.columns:
-                # 财务因子：需要外部数据源提供 PE/ROE 列
-                # 方向处理：direction=1 则 rank 直接使用
-                # direction=-1 则用 1-rank（越大越差）
-                rank = df[fname].rank(pct=True)
-                df[score_col] = rank if factor['direction'] == 1 else (1 - rank)
+            elif fname == 'pe':
+                # PE因子：优先 pe_ttm（来自 DataLoader），其次 pe 列
+                pe_col = 'pe_ttm' if 'pe_ttm' in df.columns else ('pe' if 'pe' in df.columns else None)
+                if pe_col is not None:
+                    # 低PE得分高（direction=-1）：用 (1 - rank)
+                    rank = df[pe_col].fillna(0.5).rank(pct=True)
+                    df[score_col] = 1 - rank
+                else:
+                    df[score_col] = 0.5
+
+            elif fname == 'roe':
+                # ROE因子：优先 roe 列，其次从 pe_ttm 近似
+                if 'roe' in df.columns:
+                    rank = df['roe'].rank(pct=True)
+                    df[score_col] = rank  # direction=1：高ROE得分高
+                elif 'pe_ttm' in df.columns:
+                    # 用 PE 倒数近似 ROE（当无 ROE 数据时）
+                    # ROE ≈ 1/PE，且 PE 越低 → 近似 ROE 越高
+                    # 注：这只是粗糙估算，实际 ROE 需从财报获取
+                    pe_inv = 1.0 / df['pe_ttm'].replace(0, np.nan).fillna(100)
+                    rank = pe_inv.rank(pct=True)
+                    df[score_col] = rank
+                else:
+                    df[score_col] = 0.5
 
             else:
-                # 因子默认0.5分（中性）
-                # 为什么不是0？因为中性分数应该排在中间
-                # 0分会让股票排在最后——这不公平
+                # 未知因子默认0.5分（中性）
                 df[score_col] = 0.5
 
         return df
+
 
     def generate_signals(self, data: pd.DataFrame) -> List[Signal]:
         """

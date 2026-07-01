@@ -121,6 +121,11 @@ class MeanReversionStrategy(BaseStrategy):
         oversold = self.config.get('rsi_oversold', 30)
         overbought = self.config.get('rsi_overbought', 70)
 
+        # ---- 市场状态动态仓位 (调整 C: 2026-07-01) ----
+        # 由 PortfolioEngine 每日注入 market_median_return（全市场20日中位数回报率）
+        # 当市场普跌时自动降低仓位，避免 MR 逆势"接飞刀"
+        self.market_median_return = getattr(self, 'market_median_return', 0.0)
+
         # ────── 买入信号：下轨 + 超卖 + 成交量确认 ──────
         buy_cond = (
             current['close'] < current['bb_lower']
@@ -163,6 +168,20 @@ class MeanReversionStrategy(BaseStrategy):
             # 当布林带极度收缩后开始扩张且价格触及下轨 → 反弹概率更高
             if 'bb_width' in current.index and current['bb_width'] < 0.08:
                 base_weight *= 1.1  # 收缩后反弹加仓10%
+
+            # ---- 市场状态动态仓位 (调整 C: 2026-07-01) ----
+            # 原理：市场普跌时 MR 做多 = 接飞刀
+            # 利用 PortfolioEngine 注入的 market_median_return 自动缩仓
+            if self.config.get('market_adaptive_weight', False):
+                mmr = self.market_median_return
+                weak_th = self.config.get('weak_market_threshold', -0.03)
+                severe_th = self.config.get('severe_market_threshold', -0.08)
+                normal_weight = self.config.get('weak_market_weight', 0.3)
+                severe_weight = self.config.get('severe_market_weight', 0.15)
+                if mmr < severe_th:
+                    base_weight *= severe_weight   # 严重弱势：缩至15%
+                elif mmr < weak_th:
+                    base_weight *= normal_weight   # 普通弱势：缩至30%
 
             signals.append(Signal(
                 symbol=self.symbol,

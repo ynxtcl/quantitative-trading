@@ -56,6 +56,13 @@ class TrendFollowingStrategy(BaseStrategy):
         ma_p = self.config.get('ma_filter_period', 60)
         df['ma_filter'] = df['close'].rolling(ma_p).mean()
 
+        # ============ EMA20 辅助过滤 (Step B: 2026-07-01) ============
+        if self.config.get('ema_filter_enabled', False):
+            ema_p = self.config.get('ema_filter_period', 20)
+            df['ema_filter'] = df['close'].ewm(span=ema_p, adjust=False).mean()
+        else:
+            df['ema_filter'] = np.nan
+
         # ============ ADX 计算 ============
         df['adx'] = self._calc_adx(df, 14)
 
@@ -95,6 +102,14 @@ class TrendFollowingStrategy(BaseStrategy):
             and current['close'] > current['ma_filter']
             and current['adx'] > adx_threshold
         )
+
+        # ---- EMA20 辅助过滤 (Step B: 2026-07-01) ----
+        # 当 close < EMA20 时(即使满足ADX>25也不开新仓)
+        # EMA20 反应比 MA60 快，可在下跌初期阻止逆势开仓
+        if buy_cond and self.config.get('ema_filter_enabled', False) \
+                and not pd.isna(current.get('ema_filter', np.nan)):
+            if current['close'] <= current['ema_filter']:
+                buy_cond = False
 
         if buy_cond:
             confidence = min(current['adx'] / 50.0, 1.0)

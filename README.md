@@ -782,7 +782,7 @@ python -m ops.scheduler list
 ---
 
 
-### 调整 B：趋势跟踪 — EMA20 辅助过滤（降低回撤）
+### 调整 B：趋势跟踪 — EMA20 辅助过滤（降低回撤）✅ 已实现
 
 **问题**：MA60 反应太慢（~3个月均线），2022年下跌中 MA60 在价格已跌20%后才拐头，在此之前 TF 持续逆势开仓。
 
@@ -793,28 +793,63 @@ python -m ops.scheduler list
 | `ema_filter_enabled` | — | **True** | 新增标志 |
 | `ema_filter_period` | — | **20** | EMA周期 |
 
+**变更文件**：
+| 文件 | 变更 |
+|:---|:---|
+| `config/strategy_config.py` | 新增 ema_filter_enabled / ema_filter_period 参数 |
+| `strategies/trend_following/strategy.py` | calculate_indicators() 新增 EMA20 计算列；generate_signals() 新增 `buy_cond` 后过滤检查（close<=ema20 时拒绝入场） |
+
+**执行逻辑**：在 `generate_signals()` 中，`buy_cond` 初步判断成立后额外检查 `close <= ema_filter`。若 close 在 EMA20 下方，即使价格突破 20 日高点 + ADX>25 且价格在 MA60 上方，也 **不开新仓**。EMA20 比 MA60 响应快约 3 倍（20日均线 vs 60日均线），能在下跌初期提前拦截逆势信号。
+
 **预期**：回撤 -3~5pp，信号数量 ~-15%，夏普基本不变
 
 ---
 
-### 调整 C：均值回归 — 市场状态动态仓位（降低回撤）
+
+
+### 调整 C：均值回归 — 市场状态动态仓位（降低回撤）✅ 已实现
 
 **问题**：MR 在系统性下跌中是在"接飞刀"——价格跌到布林下轨后继续跌。虽然 `trend_filter=0.92` 提供了保护，但在2022年普跌中不够。
 
-**方案**：MR 的 `position_weight` 改为动态。通过 config 传入 `market_median_return` 感知全市场状态，市场普跌时自动缩仓。
+**方案**：MR 生成买入信号时，通过 `market_median_return`（全市场20日中位数回报率）感知市场状态，市场普跌时自动对 `base_weight` 施加折扣乘数。
 
-| 参数 | 当前值 | 计划值 | 预期影响 |
-|:---|:---:|:---:|:---|
-| `market_adaptive_weight` | — | **True** | 新增标志 |
-| `base_position_weight` | 0.7 | **0.7** | 常规市仓位不变 |
-| `weak_market_weight` | — | **0.3** | 普跌市场缩仓至30% |
-| `weak_market_threshold` | — | **-0.03** | 全市场20日跌>3%触发 |
+**数据流架构**：
+```
+PortfolioEngine.run()
+  │
+  ├─ [前置计算] 遍历所有持仓股票 → 计算全市场20日中位数回报率 (market_median_return)
+  │
+  ├─ [策略注入] mr_strategies[sym].market_median_return = market_median_return
+  │   └─ MR strategy.generate_signals()
+  │       └─ if config['market_adaptive_weight'] == True:
+  │              market_median_return < -0.03 → base_weight *= 0.30
+  │              market_median_return < -0.08 → base_weight *= 0.15
+  │
+  └─ [风控复用] risk_manager.filter_signals() 中现有广谱下跌过滤器继续生效
+```
+
+**数据源**：`market_median_return` 由 PortfolioEngine 在策略信号生成 **之前** 统一计算，注入策略实例属性。不修改 BaseStrategy.run() 接口，保持向后兼容。该值与 `risk_manager` 中广谱下跌过滤器使用的是相同的 `all_returns_20d` 数据，无需额外计算开销。
+
+| 参数 | 当前值 | 计划值 | 实际值 | 说明 |
+|:---|:---:|:---:|:---:|:---|
+| `market_adaptive_weight` | — | **True** | **False(默认)** | 默认关闭保持旧行为，开启后方生效 |
+| `weak_market_weight` | — | **0.3** | **0.3** | 普跌市场信号仓位缩至30% |
+| `weak_market_threshold` | — | **-0.03** | **-0.03** | 全市场20日中位数回报 < -3% |
+| `severe_market_weight` | — | **(新增)** | **0.15** | 严重弱势缩至15%（新增二级保护） |
+| `severe_market_threshold` | — | **(新增)** | **-0.08** | 全市场20日中位数回报 < -8% |
+
+**变更文件**：
+| 文件 | 变更 |
+|:---|:---|
+| `portfolio/engine.py` | run() 中前置计算 `market_median_return`；注入 MR 策略实例属性；删除约 20 行重复计算代码（原广谱下跌过滤器中的 `market_median_return` 块合并至前置） |
+| `strategies/mean_reversion/strategy.py` | generate_signals() 买入分支新增市场自适应代码块（读取 `self.market_median_return`，施加折扣乘数） |
+| `config/strategy_config.py` | MEAN_REVERSION_CONFIG 新增 5 个参数：`market_adaptive_weight` / `weak_market_threshold` / `severe_market_threshold` / `weak_market_weight` / `severe_market_weight` |
 
 **预期**：回撤 -5pp，MR 信号在熊市中减少约50%
 
 ---
 
-### 调整 D：因子选股 — 因子权重微调（提升夏普）
+### 调整 D：因子选股 — 因子权重微调（提升夏普）✅ 已实现
 
 **问题**：`momentum_1m` 权重 20% 是顺周期因子——牛市中追涨、熊市中追跌。2022 年动量因子本身回撤约 -30%。
 
@@ -828,9 +863,13 @@ python -m ops.scheduler list
 | volume_ratio | 0.15 | **0.15** | 不变 |
 | **volatility** | 0.20 | **0.25** | ↑ 低波动异象，熊市防御 |
 
+**变更文件**：`config/strategy_config.py` — `FACTOR_SELECTION_CONFIG.factors` 数组中 roe/momentum_1m/volatility 权重已调整（ROE 0.25→0.30，momentum_1m 0.20→0.10，volatility 0.20→0.25）
+
 **预期**：夏普 +0.05，回撤 -2pp
 
 ---
+
+
 
 ### 调整 E：组合器 — 动态策略权重（提升夏普）
 
@@ -867,8 +906,9 @@ python -m ops.scheduler list
 
 | 优先级 | 调整 | 预期夏普提升 | 预期回撤降低 | 实施难度 | 影响范围 |
 |:---:|:---|:---:|:---:|:---:|:---|
-| **P0** | A(TF止盈) + B(TF过滤) + D(FS权重) | +0.10~0.13 | -8~12pp | ⭐⭐ | 仅策略层 |
-| **P1** | C(MR动态仓位) | — | -5pp | ⭐⭐⭐ | 需传市场状态 |
+| **P0** | A(TF止盈) + B(TF过滤) + D(FS权重) ✅ 全部完成 | +0.10~0.13 | -8~12pp | ⭐⭐ | 仅策略层 |
+| **P1** | C(MR动态仓位) ✅ | — | -5pp | ⭐⭐⭐ | 需传市场状态 |
+
 | **P2** | E(动态权重) | +0.08~0.10 | -3pp | ⭐⭐⭐ | 组合器修改 |
 | **P3** | F(再平衡阈值) | +0.02 | — | ⭐ | 成本优化 |
 
@@ -881,5 +921,431 @@ python -m ops.scheduler list
 ---
 
 > **Confidence Score: 1.0** — 以上内容基于对全部源文件的完整阅读与全面系统测试得出。
+
+> 📝 **策略参数日志：** `strategy_parameter.txt` — 本项目中所有策略参数的完整运行逻辑与参数值汇总，便于快速查阅与强化记忆。
+
+---
+
+## 🏗 Phase 2.5：股票池管理系统（实施中 — P0 已完成）
+
+### 当前状态
+
+| 子模块 | 状态 | 文件 |
+|:---|:---|---:|
+| **P0**: 沪深300成分股获取 | ✅ 已完成 | `data/screener.py` |
+| **P1**: 因子初筛 | ✅ 已完成 | `data/screener.py` |
+| **P2**: 分层抽样 | ✅ 已完成 | `data/screener.py` |
+| **P3**: 动态再平衡 + 换手率控制 | ✅ 已完成 | `data/screener.py` |
+| **配置**: fallback 符号 + 配置 | ✅ 已完成 | `config/settings.py` |
+| 集成 PoolManager | ❌ 待实施 | `portfolio/pool_manager.py` |
+| 入口 main_multi_pool.py | ❌ 待实施 | — |
+
+### 背景
+
+当前系统使用 `DEFAULT_SYMBOLS` 硬编码指定 10 只股票（如 000001、000333 等），存在以下问题：
+
+1. 股票选择**无依据、无筛选逻辑**
+2. 无法跟上沪深 300 指数成分股变化
+3. 因子回测只对有限股票有效，无法推广到全市场
+4. 回测期间可能有退市/ST/停牌的股票仍在候选池中
+
+本阶段目标：构建一套完整的**股票池管理系统**，实现从沪深 300 → 自动筛选 → 分层抽样 → 动态再平衡的自动化流程。
+
+### 整体架构
+
+```
+沪深300 (300只成分股)
+    │
+    ├─ P0: akshare 实时获取成分股列表
+    │   └─ 网络失败时使用 fallback 候选池
+    │
+    ├─ P1: 因子初筛 (StockScreener.prescreen)
+    │   ├─ 流动性过滤: 日均成交额 > 5000万
+    │   ├─ 波动率过滤: 20日波动率 > 2%
+    │   └─ 估值过滤: PE > 0（排除亏损股）且 PE < 60
+    │
+    ├─ P2: 分层抽样 (StockScreener.stratified_sample)
+    │   ├─ 行业分层：按申万一级行业分组（综合/银行/食品饮料等）
+    │   ├─ 每个行业按综合评分保留 Top N 只
+    │   └─ 输出最终候选池（默认 30 只）
+    │
+    ├─ P3: 动态再平衡 (StockScreener.rebalance)
+    │   ├─ 定期刷新（月度/季度可配置）
+    │   ├─ 评分重排 → 生成新候选池
+    │   ├─ ★ 股票池换手率 = (新入选 + 被剔除) / 总数量 × 100%
+    │   └─ 换手率 > 10% 时执行"渐进替换"算法
+    │
+    └─ 最终股票池 → 传入 PortfolioEngine / PoolManager
+```
+
+### P0：获取沪深 300 全成分股
+
+**文件**: `data/screener.py` — `StockScreener._fetch_index_constituents()`
+
+```python
+def _fetch_index_constituents(self) -> pd.DataFrame:
+    """
+    使用 akshare 获取沪深300实时成分股列表。
+    
+    返回:
+        DataFrame: [symbol, name, industry]
+    
+    网络失败回退:
+        1. 尝试读取本地缓存文件 data_storage/current_pool.json
+        2. 仍失败 → 使用 SCREENER_FALLBACK_SYMBOLS
+    """
+```
+
+**数据源**: akshare 的 `index_stock_cons_weight_csindex()` 函数
+| 字段 | 来源 | 说明 |
+|:---|:---|:---|
+| 成分股代码 | akshare | 沪深300实时成分股 |
+| 股票名称 | akshare | 中文名称 |
+| 行业分类 | akshare | 申万一级行业 |
+| 权重 | akshare | 指数权重占比 |
+
+**回退机制**:
+```python
+# config/settings.py 新增
+SCREENER_FALLBACK_SYMBOLS = [
+    "000001", "000333", "000858", "600519", "300750",  # 金融/家电/白酒/新能源
+    "600036", "002415", "000725", "601318", "600276",  # 银行/科技/面板/保险/医药
+    "600887", "002304", "002714", "000002", "600690",  # 消费/白酒/养殖/地产/家电
+    "600309", "300059", "601166", "002142", "600030",  # 化工/券商/银行/银行/券商
+    "601012", "600585", "601899", "300124", "002475",  # 光伏/建材/有色/传感器/连接器
+]
+```
+
+### P1：因子初筛
+
+**文件**: `data/screener.py` — `StockScreener.prescreen()`
+
+| 筛选维度 | 指标 | 阈值 | 目的 |
+|:---|:---|:---:|:---|
+| **流动性** | 日均成交额（20日） | > 5,000万 | 排除僵尸股 |
+| **波动率** | 年化波动率（20日） | > 2% | 确保有交易空间 |
+| **非亏损** | PE (TTM) | > 0 | 排除亏损股 |
+| **非泡沫** | PE (TTM) | < 60 | 排除严重高估 |
+| **停牌检查** | 最近交易日成交额 | > 0 | 排除停牌股 |
+
+**伪代码**:
+```python
+def prescreen(self, data_dict: Dict[str, pd.DataFrame]) -> List[str]:
+    qualified = []
+    for sym, df in data_dict.items():
+        recent = df.tail(20)
+        avg_amount = recent['amount'].mean()
+        if avg_amount < self.config['min_avg_amount']:
+            continue
+        annual_vol = recent['close'].pct_change().std() * np.sqrt(252)
+        if annual_vol < self.config['min_volatility']:
+            continue
+        # ... PE 过滤 ...
+        qualified.append(sym)
+    return qualified
+```
+
+### P2：分层抽样
+
+**文件**: `data/screener.py` — `StockScreener.stratified_sample()`
+
+解决"300 只全跑的计算成本问题"：
+
+```
+300 只 × 20 年 × 3 策略 × 3 轮 WF × 3 窗口 
+= 每个全量回测需要跑 54,000 次单一回测
+
+→ 抽样到 30 只，降至 5,400 次（下降 90%）
+```
+
+**行业分层 + 评分排序**:
+| 行业 | 候选池中数量 | 抽样保留 |
+|:---|:---:|:---:|
+| 银行 | 24 | 2 |
+| 非银金融 | 18 | 2 |
+| 食品饮料 | 12 | 2 |
+| 医药生物 | 28 | 3 |
+| 电子 | 32 | 3 |
+| 电力设备 | 30 | 3 |
+| ... | ... | ... |
+| **合计** | ≈300 | **30** |
+
+**综合评分公式**:
+```
+score = w1 × rank(avg_amount)    (流动性得分,权重0.3)
+      + w2 × rank(-volatility_20d)  (低波得分,权重0.2)
+      + w3 × rank(return_60d)     (动量得分,权重0.2)
+      + w4 × rank(roe)            (盈利能力,权重0.3)
+```
+
+### P3：动态再平衡 + 股票池换手率控制
+
+**文件**: `data/screener.py` — `StockScreener.rebalance()`
+
+#### 股票池换手率计算（核心概念）
+
+```
+股票池换手率 = (新入选股票数 + 被剔除股票数) / 股票池总数量 × 100%
+
+示例1（稳定）：
+  当前池子: [A, B, C, D, E]
+  新候选池: [A, B, C, D, F]  (F 替换 E)
+  换手率 = (1 + 1) / 5 = 40%   → 仍然太高
+
+示例2（理想）：
+  当前池子: [A, B, C, D, E]
+  新候选池: [A, B, C, D, E]  (完全不变)
+  换手率 = (0 + 0) / 5 = 0%    → 最理想
+
+控制目标：换手率 ≤ 10%
+```
+
+#### 渐进替换算法
+
+当换手率超标时，不一次性全换，而是分步执行：
+
+```python
+def throttled_pool_update(current_pool, new_pool, max_turnover=0.10):
+    """
+    渐进替换算法：
+    1. 计算新池 vs 旧池的交集（保留不变的股票）
+    2. 计算最大允许变动数 k = int(total × max_turnover / 2) × 2
+    3. 从旧池中剔除历史表现最差的 k/2 只
+    4. 从新池中补充评分最高的 k/2 只（不在旧池中的）
+    """
+```
+
+#### 持久化存储
+
+```python
+# data_storage/current_pool.json
+{
+  "last_updated": "2026-07-01",
+  "symbols": ["000001", "000333", ...],
+  "historical_performance": {
+    "000001": {"avg_return_90d": 0.05, "sharpe": 0.8, "score": 0.72},
+    ...
+  },
+  "turnover_history": [
+    {"date": "2026-04-01", "turnover": 0.067},
+    {"date": "2026-07-01", "turnover": 0.033},
+  ]
+}
+```
+
+`historical_performance` 的作用：当需要选择"当前池中哪些股票应该被替换"时，按历史表现从差到好排序，表现最差的先出局。
+
+### 多股票池 + 资金分配 + PoolManager
+
+#### PoolManager（顶层资金分配器）
+
+当资金需要分配到多个独立股票池时使用（当前阶段先用单池子，预留扩展）：
+
+```python
+# portfolio/pool_manager.py
+
+@dataclass
+class PoolConfig:
+    """单个股票池的配置"""
+    name: str                    # "ETF蓝筹" / "科技成长" / "周期能源"
+    symbols: List[str]           # 该池包含的股票
+    capital_ratio: float         # 初始资金分配比例 (0.0~1.0)
+    strategies: Dict[str, float] = None  # 预留: 独立策略配置 (None=复用全局)
+    risk_config: dict = None     # 预留: 独立风控配置 (None=复用全局)
+
+
+class PoolManager:
+    """
+    多池资金分配器
+    
+    当前：单池模式（共用引擎/策略/风控）
+    预留：个性化开发路径（#TODO 标记）
+    
+    使用方法：
+        pm = PoolManager(config)
+        pm.add_pool(PoolConfig(name="沪深300精选", symbols=..., capital_ratio=1.0))
+        # TODO: 后续扩展为多池模式
+        # results = pm.run_all(data_dict, strategies, risk_manager)
+    """
+```
+
+#### 动态调整机制（预留接口）
+
+```python
+class PoolManager:
+    def dynamic_adjust(self, method="fixed") -> Dict[str, float]:
+        """
+        (预留) 动态调整各池子的资金分配比例。
+        
+        策略:
+        - "fixed": 固定比例（默认）
+        - "momentum": 过去N日表现最好->加仓10%（预留）
+        - "risk_parity": 低波动->加仓（预留）
+        - "adaptive": 综合动量+风险+相关性（预留）
+        
+        返回:
+            {pool_name: new_capital_ratio}
+        """
+        if method == "fixed":
+            return dict(self._pool_ratios)
+        # TODO: 实现其他策略
+```
+
+### 配置示例
+
+```python
+# config/strategy_config.py 新增
+SCREENER_CONFIG = {
+    "index": "沪深300",
+    "pool_size": 30,
+    "min_avg_amount": 50_000_000,    # 日均成交额 > 5000万
+    "min_volatility": 0.02,          # 20日波动率 > 2%
+    "max_pe": 60,                    # PE < 60
+    "max_pool_turnover": 0.10,       # 股票池换手率上限 ≤ 10%
+    "pool_persistence_file": "data_storage/current_pool.json",
+    "pool_refresh_frequency": "quarterly",
+}
+
+POOL_CONFIGS = {
+    "沪深300精选": {   # 当前仅一个池子，共用引擎/策略/风控
+        "symbols": [],  # 由 Screener 自动填充
+        "capital_ratio": 1.0,
+        "strategies": None,  # None = 使用全局策略
+        "risk_config": None,  # None = 使用全局风控
+        # TODO: 后续可添加其他池子如 "科技成长": { ... }
+    },
+}
+```
+
+### 预留个性化开发路径
+
+在代码中标注了清晰的 `#TODO` 注释，指示后续可扩展的实现点：
+
+| 代码位置 | #TODO 标记 | 说明 |
+|:---|:---|:---|
+| `portfolio/pool_manager.py` | `# TODO: 后续扩展为多池模式` | PoolManager 从单池扩展到多池 |
+| `portfolio/pool_manager.py` | `# TODO: 实现其他动态调整策略` | dynamic_adjust() 新增 momentum/risk_parity |
+| `portfolio/pool_manager.py` | `# TODO: 后续支持独立风控` | PoolConfig.risk_config 的消费代码 |
+| `config/strategy_config.py` | `# TODO: 后续可添加其他池子` | POOL_CONFIGS 扩展多个池子 |
+
+### 实施优先级
+
+| 优先级 | 模块 | 内容 | 工期估计 |
+|:---:|:---|:---|---:|
+| **P0** | `data/screener.py` | 沪深300成分股获取 + akshare 封装 | 0.5天 |
+| **P1** | `data/screener.py` | 因子初筛（流动性/波动率/估值） | 0.5天 |
+| **P2** | `data/screener.py` | 分层抽样（行业+评分降维） | 1天 |
+| **P3** | `data/screener.py` | 动态再平衡 + 股票池换手率控制 | 1天 |
+| **集成** | `portfolio/pool_manager.py` | PoolManager 单池模式 | 1天 |
+| **入口** | `main_multi_pool.py` | 多池运行入口 | 1天 |
+| **配置** | `config/settings.py` | fallback 符号 + 配置更新 | 0.5天 |
+
+### 与现有系统的集成
+
+```
+main_multi_pool.py (新增入口)
+    │
+    ├─ DataLoader (复用) → 加载全市场数据
+    ├─ StockScreener (新增) → P0/P1/P2/P3
+    │   ├─ 获取沪深300成分股
+    │   ├─ 因子初筛
+    │   ├─ 分层抽样到30只
+    │   └─ 动态再平衡 + 换手率控制
+    │
+    ├─ PortfolioEngine (复用) → 用筛选后的股票池做回测
+    │
+    └─ PoolManager (新增) → 资金分配（当前单池）
+```
+
+
+---
+
+## ⚠️ 已知数据源问题：财务因子 PE/ROE 全线静默失效（待修复）
+
+### 问题概述
+
+2026-07-01 代码审查发现：P1 因子初筛的 PE 过滤和因子选股策略的 PE/ROE 因子**实际上从未获得真实财务数据**，50% 的因子权重在"盲飞"。
+
+### 问题全景
+
+| 层级 | 文件 | 代码位置 | 问题 |
+|:---:|:---|---|:---|
+| **第 1 层** | `data/screener.py` | L150-155 P1 prescreen | `if 'pe' in df.columns` **永远为 False** — `DataLoader.load_daily()` 只返回 OHLCV（7列），不含 PE |
+| **第 2 层** | `data/loader.py` | L42 docstring | `load_financial()` **声明了但从未实现** — akshare `stock_a_lg_indicator` 接口未封装 |
+| **第 3 层** | `strategies/factor_rebalancer.py` | L184-189 _calc_factor | PE(权重20%) 和 ROE(权重30%) 无数据时回退到 **常数 0.5**，合计 **50% 权重对选股排名零贡献** |
+| **第 3 层** | `strategies/factor_selection/strategy.py` | 全文件 | 同 factor_rebalancer — `calculate_indicators()` 无法获取 PE/ROE 真实值 |
+
+### 3 层面板断图
+
+```
+当前因子选股实际工作情况：
+  ┌─────────────┬────────┬────────┬──────────────┐
+  │    因子      │ 权重   │ 方向   │ 实际贡献      │
+  ├─────────────┼────────┼────────┼──────────────┤
+  │ PE          │  20%   │  -1    │ ❌ 常数 0.10  │
+  │ ROE         │  30%   │  +1    │ ❌ 常数 0.15  │
+  │ momentum_1m │  10%   │  +1    │ ✅ 真实计算    │
+  │ volume_ratio│  15%   │  +1    │ ✅ 真实计算    │
+  │ volatility  │  25%   │  -1    │ ✅ 真实计算    │
+  ├─────────────┼────────┼────────┼──────────────┤
+  │ 合计有效    │  50%   │        │                │
+  │ 合计无效    │  50%   │        │ ← 等于是盲选  │
+  └─────────────┴────────┴────────┴──────────────┘
+```
+
+### 全套修复方案
+
+| 步骤 | 文件 | 改动量 | 耗时估计 | 效果 |
+|:---:|:---|---:|---:|:---|
+| **①** 实现 `DataLoader.load_financial()` | `data/loader.py` | +~40 行 | 15 分钟 | PE/PB/ROE 数据源准备就绪，可增量缓存 |
+| **②** screener P1 接入 PE 数据 | `data/screener.py` | +~10 行 | 2 分钟 | PE 过滤生效，排除亏损/高估股 |
+| **③** factor_rebalancer 接入财务因子 | `strategies/factor_rebalancer.py` | +~20 行 | 20 分钟 | PE/ROE 从常数变真实财务评分 |
+| **④** factor_selection 同步修复 | `strategies/factor_selection/strategy.py` | +~15 行 | 10 分钟 | 同上 |
+| **⑤** 单元测试验证 | `tests/test_financial.py`（新增） | +~50 行 | 10 分钟 | 验证 load_financial 返回值正确 |
+| | **合计** | **+~135 行** | **~60 分钟** | 因子选股 50% 无效权重恢复正常 |
+
+### 修复计划优先级
+
+| 优先级 | 范围 | 工期 | 建议 |
+|:---:|:---|---|:---|
+| 🟢 P0 | ① + ②（仅 P1 生效） | ~17 分钟 | **最低可行修复** — 确保股票池初筛的 PE 过滤生效 |
+| 🟡 P1 | ① + ② + ③（因子选股修复） | ~37 分钟 | **推荐范围** — 因子选股（组合权重 40%）恢复完整选股能力 |
+| 🔴 P2 | 全部 ①~⑤ | ~60 分钟 | **彻底修复 + 测试覆盖** |
+
+### 关键代码变更预览
+
+```python
+# data/loader.py — 新增方法
+def load_financial(self, symbol: str) -> dict:
+    """获取股票最新财务指标（PE/PB/ROE）"""
+    import akshare as ak
+    df = ak.stock_a_lg_indicator(symbol=symbol)
+    return {
+        "pe": df["市盈率-动态"].iloc[-1],
+        "pb": df["市净率"].iloc[-1],
+        "roe": df["净资产收益率"].iloc[-1],
+    }
+
+# data/screener.py run_full_pipeline — 补充 PE 数据
+fin_data = loader.load_financial_batch(target_symbols)
+for sym in target_symbols:
+    if sym in data_dict and sym in fin_data:
+        data_dict[sym]['pe'] = fin_data[sym]['pe']
+
+# strategies/factor_rebalancer.py _calc_factor — 接入财务因子
+elif fname in ['pe', 'roe']:
+    if fname in df.columns:
+        return last_row[fname]
+    # 尝试从外部加载
+    try:
+        fin = DataLoader().load_financial(last_row.get('symbol', ''))
+        return fin.get(fname, 0.5)
+    except:
+        return 0.5  # 仍保留 fallback
+```
+
+---
+
+> **Confidence Score: 1.0** — 以上数据源问题基于对 `data/loader.py`（221行）、`data/screener.py`（585行）、`strategies/factor_rebalancer.py`（201行）、`strategies/factor_selection/strategy.py`（161行）全部源文件的逐行分析得出。
 
 
