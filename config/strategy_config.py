@@ -63,7 +63,9 @@ TREND_FOLLOWING_CONFIG = {
     #       比值越小 = 相对波动越大 = 需要降低仓位
 
     # ★ 分阶段止盈 (2026-07-01 Step A) ★
-    "take_profit_enabled": True,       # 启用分阶段止盈
+    "take_profit_enabled": True,       # 启用分阶段止盈（2026-07-01 Step A）
+
+
     "take_profit_lookback": 10,        # 10日高点参考
     "take_profit_drawdown": 0.08,      # 从高点回落8%触发
     "take_profit_exit_ratio": 0.5,     # 平掉一半仓位

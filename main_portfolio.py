@@ -143,15 +143,14 @@ def run_strategy_wf(data_dict: dict, factory_fn, label: str):
 def main():
     print("=" * 65)
     print("  定量交易系统 — Phase 2：多策略组合回测")
-    print("  策略：趋势跟踪(40%) + 均值回归(30%) + 因子选股(30%)")
-    print("  标的：沪深300成分股 (演示3只)")
+    print("  策略：趋势跟踪(40%) + 均值回归(20%) + 因子选股(40%)")
+    print("  标的：A股10只（银行/家电/白酒/科技/新能源/保险/化工）")
     print("=" * 65)
 
     # ============ 1. 数据加载 ============
     print("\n[Step 1] 加载数据")
     loader = DataLoader()
-    # 只用前3只做演示（保持与 Phase 1 一致）
-    symbols = DEFAULT_SYMBOLS[:3]
+    symbols = DEFAULT_SYMBOLS
     data_dict = loader.load_multiple(
         symbols,
         start=BACKTEST_CONFIG['start_date'],
@@ -221,8 +220,8 @@ def main():
     combiner = PortfolioCombiner()
     combiner.set_weights({
         'trend_following': TREND_FOLLOWING_CONFIG.get('weight', 0.4),
-        'mean_reversion': MEAN_REVERSION_CONFIG.get('weight', 0.3),
-        'factor_selection': FACTOR_SELECTION_CONFIG.get('weight', 0.3),
+        'mean_reversion': MEAN_REVERSION_CONFIG.get('weight', 0.2),
+        'factor_selection': FACTOR_SELECTION_CONFIG.get('weight', 0.4),
     })
 
     # 风控系统（从外部配置读取参数）

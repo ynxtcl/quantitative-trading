@@ -116,5 +116,64 @@
       "000858"
     ],
     "notes": ""
+  },
+  {
+    "run_id": "R003",
+    "timestamp": "2026-06-29T14:46:26.342211",
+    "description": "default",
+    "symbols": [
+      "000001",
+      "000333",
+      "000858"
+    ],
+    "config_snapshot": {
+      "max_single_weight": 0.3,
+      "max_total_position": 0.95,
+      "stop_loss": 0.08,
+      "max_daily_loss": 0.03,
+      "max_daily_symbols": 5,
+      "max_drawdown": 0.25,
+      "enforce_stop_loss": true,
+      "vol_adaptive": true,
+      "vol_low": 0.15,
+      "vol_high": 0.4,
+      "max_industry_weight": 0.5,
+      "industry_map": {
+        "000001": "银行",
+        "000333": "家电",
+        "000858": "白酒",
+        "002415": "科技",
+        "300750": "新能源"
+      }
+    },
+    "total_return": 0.1948,
+    "annual_return": 0.0377,
+    "sharpe_ratio": 0.1959,
+    "max_drawdown": -0.3455,
+    "volatility": 0.1302,
+    "win_rate": 0.3694,
+    "profit_factor": 1.06,
+    "calmar_ratio": 0.1091,
+    "final_value": 119479.05,
+    "total_trades": 111,
+    "total_days": 1212,
+    "risk_stats": {
+      "total_signals_in": 1625,
+      "single_weight_clipped": 237,
+      "daily_symbol_rejected": 0,
+      "total_position_clipped": 0,
+      "total_position_rejected": 0,
+      "drawdown_breaker_triggered": 466,
+      "industry_clipped": 0,
+      "signals_out": 574,
+      "max_daily_ratio_used": 0.9077225430297476
+    },
+    "stop_loss_triggered": 538,
+    "traded_symbols": [
+      "000001",
+      "000333",
+      "000858"
+    ],
+    "notes": ""
   }
 ]

@@ -148,10 +148,26 @@ class MeanReversionStrategy(BaseStrategy):
 
         if buy_cond:
             confidence = min(abs(current['deviation']) / 3.0, 1.0)
+
+            # ---- 偏离度动态仓位 (2026-07-01 新增) ----
+            # 偏离度 Z-score 越大 → 回归信号越强 → 仓位越高
+            # Z=2 (触及下轨) → weight * 1.0
+            # Z=3 (极度超卖) → weight * 1.3 (最多加30%)
+            base_weight = self.config.get('position_weight', 0.7)
+            deviation = abs(current.get('deviation', 0))
+            if self.config.get('use_deviation_confidence', False) and deviation > 2.0:
+                deviation_multiplier = 1.0 + (deviation - 2.0) * 0.3  # Z=2→1.0x, Z=3→1.3x
+                base_weight *= min(deviation_multiplier, 1.3)
+
+            # ---- 布林带收缩突破预警 (2026-07-01 新增) ----
+            # 当布林带极度收缩后开始扩张且价格触及下轨 → 反弹概率更高
+            if 'bb_width' in current.index and current['bb_width'] < 0.08:
+                base_weight *= 1.1  # 收缩后反弹加仓10%
+
             signals.append(Signal(
                 symbol=self.symbol,
                 direction=1,
-                weight=self.config.get('position_weight', 0.5),
+                weight=round(base_weight, 4),
                 price=current['close'],
                 confidence=round(confidence, 2),
                 strategy='mean_reversion',

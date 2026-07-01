@@ -126,8 +126,50 @@ class InstrumentedRiskManager(RiskManager):
 
 # Top-level code moved under __main__ guard
 if __name__ == "__main__":
+    # ---- 数据加载（复用 main_portfolio.py 的流程） ----
+    print("=" * 60)
+    print("  DEBUG: 风控规则触发统计诊断")
+    print("=" * 60)
+    
+    loader = DataLoader()
+    symbols = DEFAULT_SYMBOLS[:3]
+    raw_data = loader.load_multiple(
+        symbols,
+        start=BACKTEST_CONFIG['start_date'],
+        end=BACKTEST_CONFIG['end_date'],
+    )
+    if not raw_data:
+        print("[FAIL] 数据加载失败")
+        sys.exit(1)
+    
+    # 数据清洗
+    cleaned_data = {}
+    for sym, df in raw_data.items():
+        cleaned_data[sym] = clean_daily_data(df)
+    
+    # 创建策略实例（同 main_portfolio.py）
+    tf_strategies = {}
+    mr_strategies = {}
+    for sym in symbols:
+        tf_cfg = dict(TFC)
+        tf_cfg['symbol'] = sym
+        tf_strategies[sym] = TrendFollowingStrategy('trend_following', tf_cfg)
+        
+        mr_cfg = dict(MRC)
+        mr_cfg['symbol'] = sym
+        mr_strategies[sym] = MeanReversionStrategy('mean_reversion', mr_cfg)
+    
+    rebalancer = FactorRebalancer(FSC)
+    combiner = PortfolioCombiner()
+    combiner.set_weights({
+        'trend_following': TFC.get('weight', 0.4),
+        'mean_reversion': MRC.get('weight', 0.3),
+        'factor_selection': FSC.get('weight', 0.3),
+    })
+    risk_mgr = InstrumentedRiskManager(dict(RISK_CONFIG))
+    
     engine = PortfolioEngine(BACKTEST_CONFIG)
-    result = engine.run(cleaned, tf_strategies, mr_strategies, rebalancer, combiner, risk_mgr)
+    result = engine.run(cleaned_data, tf_strategies, mr_strategies, rebalancer, combiner, risk_mgr)
 
     print(f"\n{'=' * 60}")
     print(f"  BACKTEST OVERVIEW")

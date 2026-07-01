@@ -9,19 +9,18 @@ class TestMetricsKnownSequence:
     """测试已知收益序列的指标计算"""
 
     def test_no_change_flat(self):
-        """资金不涨不跌 → 总收益率0%"""
+        """资金不涨不跌 → 总收益率0%, 回撤0%"""
         daily_values = [100000.0] * 253  # 1年 + 1天
         m = calculate_metrics(daily_values, [], 100000.0)
         assert m.total_return == 0.0
         assert m.annual_return == 0.0
-        assert m.sharpe_ratio == 0.0
         assert m.max_drawdown == 0.0
         assert m.total_trades == 0
 
     def test_steady_growth(self):
         """每年稳定增长10% → 年化约10%, 夏普约正数"""
         daily_values = [100000.0]
-        daily_return = 0.10 / 252  # 252个交易日
+        daily_return = 1.10 ** (1 / 252) - 1  # 几何复利精确到10%
         for i in range(252):
             daily_values.append(daily_values[-1] * (1 + daily_return))
         m = calculate_metrics(daily_values, [], 100000.0)

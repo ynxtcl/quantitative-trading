@@ -96,13 +96,17 @@ class PortfolioCombiner:
             total_confidence = 0.0
             n_signals = 0
             source_strategies = []
+            buy_count = 0
+            sell_count = 0
 
             for strategy_name, sigs in strategy_dict.items():
                 for sig in sigs:
                     if sig.direction == 1:       # 买入 → 正权重
                         net_weight += sig.weight
+                        buy_count += 1
                     elif sig.direction == -1:    # 卖出 → 负权重
                         net_weight -= sig.weight
+                        sell_count += 1
                     total_confidence += sig.confidence
                     n_signals += 1
                     source_strategies.append(strategy_name)
@@ -114,9 +118,23 @@ class PortfolioCombiner:
             # 置信度 = 所有信号置信度的平均值
             avg_confidence = total_confidence / n_signals if n_signals > 0 else 0.5
 
+            # ---- 信号一致性加权 (2026-07-01 新增) ----
+            # 当多个策略方向一致时，说明市场有高度共识，应加大仓位
+            # 当策略出现分歧时，说明市场方向不明确，应降低仓位
+            consensus_multiplier = 1.0
+            if buy_count > 0 and sell_count == 0:
+                # 全买入：多个策略一致看多 → 加仓20%
+                consensus_multiplier = 1.2
+            elif sell_count > 0 and buy_count == 0:
+                # 全卖出：多个策略一致看空 → 加仓15%
+                consensus_multiplier = 1.15
+            elif buy_count > 0 and sell_count > 0:
+                # 出现分歧 → 减仓30%
+                consensus_multiplier = 0.7
+
             # 确定方向
             direction = 1 if net_weight > 0 else -1
-            weight = abs(net_weight)
+            weight = abs(net_weight) * consensus_multiplier
 
             # 构建最终信号（取第一个信号的价格和时间）
             first_sig = None

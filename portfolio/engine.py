@@ -122,13 +122,16 @@ class PortfolioEngine:
     def __init__(self, config: dict):
         self.initial_capital = config['initial_capital']
         self.commission = config['commission']
+        self.min_commission = config.get('min_commission', 5.0)
         self.stamp_tax = config['stamp_tax']
         self.slippage = config['slippage']
         self.peak_value = self.initial_capital
         self.daily_return_buffer = []  # 跟踪峰值净值（用于回撤熔断）
         self.cost_basis: Dict[str, float] = {}  # {symbol: 平均持仓成本（含佣金）}
         self.stop_loss_triggered: int = 0        # 止损触发次数统计
+        self.trailing_stop_triggered: int = 0    # 移动止损触发次数统计
         self.daily_return_buffer: List[float] = []  # C1: 最近20日收益率缓存
+        self.peak_prices: Dict[str, float] = {}     # {symbol: 持仓期间最高价（用于Trailing Stop）}
 
         self.capital = self.initial_capital
         self.positions: Dict[str, int] = {}
@@ -140,6 +143,8 @@ class PortfolioEngine:
             tf_strategies: Dict[str, BaseStrategy] = {},
             mr_strategies: Dict[str, BaseStrategy] = {},
             rebalancer: Optional[FactorRebalancer] = None,
+            xgb_strategies: Dict[str, BaseStrategy] = {},
+            xgb_data_dict: Optional[Dict[str, pd.DataFrame]] = None,
             combiner: Optional[PortfolioCombiner] = None,
             risk_manager: Optional[RiskManager] = None) -> PortfolioResult:
         """
@@ -147,14 +152,23 @@ class PortfolioEngine:
 
         参数:
             data_dict: {symbol: DataFrame} 所有股票的 OHLCV 数据
+                       TF/MR/FS 使用此数据（原始 OHLCV）
             tf_strategies: {symbol: TrendFollowingStrategy}
             mr_strategies: {symbol: MeanReversionStrategy}
             rebalancer: FactorRebalancer 实例（None=跳过因子选股）
+            xgb_strategies: {symbol: XGBoostSignalStrategy}  (Phase 4.5 新增)
+            xgb_data_dict: {symbol: DataFrame} 带 ML 特征的数据
+                           None 时引擎自动调用 engineer_features (Phase 4.5 新增)
             combiner: PortfolioCombiner 实例
             risk_manager: RiskManager 实例
 
         返回:
             PortfolioResult 包含每日净值 + 交易记录
+
+        数据流完整性保障:
+            - xgb_data_dict 应包含预计算的 22 维特征列
+            - data_dict 保持原始 OHLCV（TF/MR 不需要特征列）
+            - 两者索引必须一致（日期对齐在方法内部处理）
         """
         self._reset()
 
@@ -169,6 +183,21 @@ class PortfolioEngine:
                 else:
                     df.index = pd.to_datetime(df.index)
             aligned[sym] = df
+
+        # ---- 对齐 XGBoost 数据（如果有） ----
+        xgb_aligned: Dict[str, pd.DataFrame] = {}
+        if xgb_data_dict:
+            for sym, df in xgb_data_dict.items():
+                xdf = df.copy()
+                if not isinstance(xdf.index, pd.DatetimeIndex):
+                    if 'date' in xdf.columns:
+                        xdf = xdf.set_index('date')
+                    else:
+                        xdf.index = pd.to_datetime(xdf.index)
+                xgb_aligned[sym] = xdf
+        else:
+            # 如果没有预计算特征数据，使用 data_dict（XGBoost 策略内部会调用 engineer_features）
+            xgb_aligned = aligned
 
         # 取所有股票交易日的并集
         all_dates = pd.DatetimeIndex([])
@@ -188,6 +217,7 @@ class PortfolioEngine:
                 'trend_following': [],
                 'mean_reversion': [],
                 'factor_selection': [],
+                'xgboost': [],
             }
 
             # ---- 运行择时策略（TF + MR）- 跳过空的策略字典 ----
@@ -212,6 +242,16 @@ class PortfolioEngine:
                     if mr_strategies and sym in mr_strategies:
                         mr_sigs = mr_strategies[sym].run(bar)
                         strategies_signals['mean_reversion'].extend(mr_sigs)
+
+                    # XGBoost ML 策略（Phase 4.5 新增）
+                    # 使用预计算特征数据（xgb_aligned）而非原始 OHLCV（aligned）
+                    # 如果 xgb_aligned 中日期不存在，跳过（可能上市日不同）
+                    if xgb_strategies and sym in xgb_strategies:
+                        sym_xgb = xgb_aligned.get(sym)
+                        if sym_xgb is not None and current_date in sym_xgb.index:
+                            xgb_bar = sym_xgb.loc[:current_date]
+                            xgb_sigs = xgb_strategies[sym].run(xgb_bar)
+                            strategies_signals['xgboost'].extend(xgb_sigs)
 
             # ---- 因子选股月度再平衡 ----
             if rebalancer is not None:
@@ -245,17 +285,38 @@ class PortfolioEngine:
             self.peak_value = max(self.peak_value, current_value)
             current_drawdown = (self.peak_value - current_value) / self.peak_value if self.peak_value > 0 else 0.0
 
+            # ---- 计算所有持仓股票的20日中位数回报率（用于广谱下跌过滤器）----
+            market_median_return = 0.0
+            if len(self.daily_records) >= 20:
+                # 收集每只有持仓的股票的20日回报率
+                all_returns_20d = []
+                for sym in symbols:
+                    if sym in aligned and sym in current_prices and current_prices[sym] > 0:
+                        df_sym = aligned[sym]
+                        idx = df_sym.index.get_loc(current_date) if current_date in df_sym.index else -1
+                        if idx >= 20:
+                            price_today = float(df_sym.iloc[idx]['close'])
+                            price_20d_ago = float(df_sym.iloc[idx - 20]['close'])
+                            if price_20d_ago > 0:
+                                ret_20d = (price_today - price_20d_ago) / price_20d_ago
+                                all_returns_20d.append(ret_20d)
+                if all_returns_20d:
+                    import numpy as np
+                    market_median_return = float(np.median(all_returns_20d))
+
             # ---- B1: 组合级止损检查（在风控过滤之前执行） ----
             # 强制平仓信号优先于普通信号，确保亏损头寸及时了结
             stop_loss_pct = risk_manager.config.get("stop_loss", 0.08) if risk_manager is not None else 0.08
+            trailing_pct = risk_manager.config.get("trailing_stop", 0.15) if risk_manager is not None else 0.15
             enforce_sl = risk_manager.config.get("enforce_stop_loss", True) if risk_manager is not None else False
             forced_sells = []
             if enforce_sl:
-                forced_sells = self._check_stop_loss(current_prices, current_date, stop_loss_pct)
+                forced_sells = self._check_stop_loss(current_prices, current_date, stop_loss_pct, trailing_pct)
                 if forced_sells:
                     combined_signals = forced_sells + combined_signals
 
             # ---- 计算每只股票的当前仓位比例（B3: 累计持仓上限用） ----
+
             position_ratios: Dict[str, float] = {}
             if total_assets > 0:
                 for sym, shares in self.positions.items():
@@ -277,7 +338,9 @@ class PortfolioEngine:
                     current_drawdown=current_drawdown,
                     current_position_ratios=position_ratios,
                     annualized_volatility=annualized_vol,
+                    market_median_return=market_median_return,
                 )
+
             else:
                 filtered_signals = combined_signals
 
@@ -314,28 +377,68 @@ class PortfolioEngine:
     def _check_stop_loss(self,
                          current_prices: Dict[str, float],
                          current_date: pd.Timestamp,
-                         stop_loss_pct: float = 0.08) -> List[Signal]:
-        """Check all positions for stop loss triggers."""
+                         stop_loss_pct: float = 0.08,
+                         trailing_pct: float = 0.15) -> List[Signal]:
+        """Check all positions for stop loss & trailing stop triggers.
+
+        双重保护机制：
+        1. 固定止损（stop_loss）：从成本价计算亏损比例
+        2. 移动止损（trailing_stop）：从持仓期间最高价回落比例
+
+        两者任一触发都会生成卖出信号。
+        trailing_pct 由调用方传入（来自 risk_manager.config），默认15%。
+        """
         signals: List[Signal] = []
+
         for sym, shares in list(self.positions.items()):
             if shares <= 0 or sym not in current_prices:
+                # 无持仓时清除 peak_prices 记录
+                self.peak_prices.pop(sym, None)
                 continue
             price = current_prices[sym]
             cost = self.cost_basis.get(sym, 0)
-            if cost <= 0:
-                continue
-            unrealized_pnl = (price - cost) / cost
-            if unrealized_pnl < -stop_loss_pct:
-                self.stop_loss_triggered += 1
-                signals.append(Signal(
-                    symbol=sym,
-                    direction=-1,
-                    weight=1.0,
-                    price=price,
-                    confidence=1.0,
-                    strategy='risk_manager',
-                    timestamp=current_date,
-                ))
+
+            # ---- 固定止损检查 ----
+            if cost > 0:
+                unrealized_pnl = (price - cost) / cost
+                if unrealized_pnl < -stop_loss_pct:
+                    self.stop_loss_triggered += 1
+                    signals.append(Signal(
+                        symbol=sym,
+                        direction=-1,
+                        weight=1.0,
+                        price=price,
+                        confidence=1.0,
+                        strategy='risk_manager',
+                        timestamp=current_date,
+                    ))
+                    # 已触发止损，跳过 trailing stop 检查（避免重复）
+                    self.peak_prices.pop(sym, None)
+                    continue
+
+            # ---- 移动止损（Trailing Stop）检查 ----
+            # 更新持仓期间最高价
+            if sym not in self.peak_prices or price > self.peak_prices[sym]:
+                self.peak_prices[sym] = price
+
+            # 检查是否从最高价回落超过阈值
+            peak = self.peak_prices[sym]
+            if peak > 0:
+                drawdown_from_peak = (peak - price) / peak
+                if drawdown_from_peak >= trailing_pct:
+                    self.trailing_stop_triggered += 1
+                    signals.append(Signal(
+                        symbol=sym,
+                        direction=-1,
+                        weight=1.0,
+                        price=price,
+                        confidence=1.0,
+                        strategy='risk_manager_trailing',
+                        timestamp=current_date,
+                    ))
+                    # 触发后清除峰值记录
+                    self.peak_prices.pop(sym, None)
+
         return signals
 
     # --------------------------------------------
@@ -354,10 +457,15 @@ class PortfolioEngine:
         if signal.direction == 1:
             exec_price = price * (1 + self.slippage)
             allocated = self.capital * signal.weight
-            max_qty = int(allocated / (exec_price * (1 + self.commission)))
+            max_qty_raw = allocated / (exec_price * (1 + self.commission))
+            max_qty = int(max_qty_raw)
+            # A股最小交易单位=1手=100股
+            max_qty = (max_qty // 100) * 100
             if max_qty <= 0:
                 return
-            cost = exec_price * max_qty * self.commission
+            # 佣金（最低5元）
+            raw_comm = exec_price * max_qty * self.commission
+            cost = max(self.min_commission, raw_comm)
             total = exec_price * max_qty + cost
             if total <= self.capital:
                 self.capital -= total
@@ -379,9 +487,13 @@ class PortfolioEngine:
         elif signal.direction == -1 and self.positions.get(sym, 0) > 0:
             exec_price = price * (1 - self.slippage)
             sell_qty = int(self.positions[sym] * signal.weight)
+            # A股最小交易单位=1手=100股
+            sell_qty = (sell_qty // 100) * 100
             if sell_qty <= 0:
                 return
-            cost = exec_price * sell_qty * self.commission
+            # 卖出佣金（最低5元）+ 印花税
+            raw_comm = exec_price * sell_qty * self.commission
+            cost = max(self.min_commission, raw_comm)
             tax = exec_price * sell_qty * self.stamp_tax
             self.capital += exec_price * sell_qty - cost - tax
             self.positions[sym] -= sell_qty
@@ -447,6 +559,8 @@ class PortfolioEngine:
         self.positions = {}
         self.cost_basis = {}
         self.stop_loss_triggered = 0
+        self.trailing_stop_triggered = 0
+        self.peak_prices = {}
         self.trades = []
         self.daily_records = []
         self.peak_value = self.initial_capital

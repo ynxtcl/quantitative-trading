@@ -14,6 +14,7 @@
 4. 多标的互斥：每天最多交易 N 只不同的股票
 5. 组合回撤熔断：组合最大回撤超过阈值时禁止开新仓
 6. 置信度排序：高置信度信号优先分配仓位
+7. 广谱下跌过滤器（前置风控）：过半股票下跌时自动降仓
 """
 from typing import Dict, List
 from strategies.base import Signal
@@ -32,6 +33,7 @@ class RiskManager:
     - C1 波动率自适应：高波动时自动降低仓位上限
     - C2 行业集中度：单行业总暴露不超过 max_industry_weight
     - 置信度排序：过滤前先按置信度降序排列，高置信度信号优先
+    - 广谱下跌过滤器：market_median_return < threshold 时自动降仓
     """
 
     def __init__(self, config: dict = None):
@@ -63,16 +65,20 @@ class RiskManager:
                        current_positions: Dict[str, int] = None,
                        current_drawdown: float = 0.0,
                        current_position_ratios: Dict[str, float] = None,
-                       annualized_volatility: float = 0.0) -> List[Signal]:
+                       annualized_volatility: float = 0.0,
+                       market_median_return: float = 0.0) -> List[Signal]:
         """
         过滤风险信号
 
         风控流程：
-        0. 组合回撤熔断：current_drawdown > max_drawdown → 返回空（禁止开新仓）
-        1. 按置信度降序排列，高置信度优先执行
-        2. 单标的风控（仅限买入信号）：signal.weight ≤ max_single_weight
-        3. 每日符号数限制：最多交易 N 只不同股票
-        4. 总仓位风控：当前仓位 + 信号仓位 ≤ max_total_position
+        0. 硬熔断底线：current_drawdown > max_drawdown → 返回空
+        0b. 渐进式回撤缩仓（progressive_drawdown=True）：回撤15%/25%/35%逐级降仓位
+        0c. 广谱下跌过滤器（前置风控）：过半股票20日跌超阈值→自动降总仓位上限
+        1. 波动率目标制（vol_target > 0）：年化波动率超过目标时自动缩仓
+        2. 按置信度降序排列，高置信度优先执行
+        3. 单标的风控（仅限买入信号）：signal.weight ≤ max_single_weight
+        4. 每日符号数限制：最多交易 N 只不同股票
+        5. 总仓位风控：当前仓位 + 信号仓位 ≤ max_total
 
         参数:
             signals: 待过滤的信号列表（已净权重求和后）
@@ -81,6 +87,7 @@ class RiskManager:
             current_drawdown: 当前组合回撤比例 (0.0 ~ 1.0)
             current_position_ratios: 当前各股票仓位占比 {symbol: ratio}（B3累计上限用）
             annualized_volatility: 当前年化波动率（C1波动率自适应用）
+            market_median_return: (2026-07-01 v2) 所有持仓股票20日中位数回报率
 
         返回:
             过滤后的信号列表
@@ -88,11 +95,35 @@ class RiskManager:
         if not signals:
             return []
 
-        # ==== 规则 0: 组合回撤熔断 ====
+        # ==== 规则 0: 硬熔断底线 ====
         max_dd = self.config.get("max_drawdown", 0.25)
         if current_drawdown > max_dd:
-            # 回撤超标 → 熔断：返回空信号，只允许卖出（由引擎侧处理）
-            return []
+            return []  # 回撤超标 → 硬熔断
+
+        # ==== 规则 0c: 广谱下跌过滤器（前置风控）====
+        # 原理：当市场上过半股票都在下跌时，即使组合回撤还没触发熔断，
+        # 也应该主动降低仓位。这是"前置"风控——不等回撤发生就行动。
+        weakness_factor = 1.0
+        if self.config.get("market_weakness_enabled", False):
+            threshold = self.config.get("market_weakness_threshold", -0.05)
+            severe = self.config.get("market_weakness_severe", -0.10)
+            if market_median_return < severe:
+                weakness_factor = 0.25  # 严重弱势：仅25%仓位
+            elif market_median_return < threshold:
+                weakness_factor = 0.50  # 普通弱势：仅50%仓位
+
+        # ==== 规则 0b: 渐进式回撤缩仓 ====
+        drawdown_factor = 1.0
+        if self.config.get("progressive_drawdown", False):
+            dd_stage1 = self.config.get("dd_stage1", 0.15)
+            dd_stage2 = self.config.get("dd_stage2", 0.25)
+            dd_stage3 = self.config.get("dd_stage3", 0.35)
+            if current_drawdown > dd_stage3:
+                drawdown_factor = 0.30  # 回撤>35%: 仅30%仓位
+            elif current_drawdown > dd_stage2:
+                drawdown_factor = 0.50  # 回撤>25%: 仅50%仓位
+            elif current_drawdown > dd_stage1:
+                drawdown_factor = 0.70  # 回撤>15%: 仅70%仓位
 
         max_symbols = self.config.get("max_daily_symbols", 5)
         max_single = self.config["max_single_weight"]
@@ -101,16 +132,26 @@ class RiskManager:
         max_industry = self.config.get("max_industry_weight", 0.50)
 
         # ---- C1: 波动率自适应 ----
-        # 高波动时降低仓位上限
         vol_factor = 1.0
         if self.config.get("vol_adaptive", True) and annualized_volatility > 0:
             vol_low = self.config.get("vol_low", 0.15)
             vol_high = self.config.get("vol_high", 0.40)
             if annualized_volatility > vol_low:
-                # 线性递减：vol_low时 factor=1.0, vol_high时 factor=0.5
                 vol_factor = max(0.5, 1.0 - (annualized_volatility - vol_low) / (vol_high - vol_low) * 0.5)
-            max_single *= vol_factor
-            max_total *= vol_factor
+
+        # ---- 波动率目标制 ----
+        # 目标年化波动率 = vol_target
+        # 当实际波动率 > 目标时，按比例缩仓
+        # 例如：目标18%，实际36% → 仓位减半
+        vol_target_factor = 1.0
+        vol_target = self.config.get("vol_target", 0)
+        if vol_target > 0 and annualized_volatility > vol_target:
+            vol_target_factor = vol_target / annualized_volatility
+
+        # 综合所有因子
+        combined_factor = drawdown_factor * vol_factor * vol_target_factor * weakness_factor
+        max_single *= combined_factor
+        max_total *= combined_factor
 
         # 已有持仓的股票列表
         existing_positions = set()
@@ -127,7 +168,7 @@ class RiskManager:
                 ind = industry_map.get(sym, "其他")
                 industry_exposure[ind] = industry_exposure.get(ind, 0.0) + ratio
 
-        # ==== 规则 1: 按置信度排序（高置信度优先） ====
+        # ==== 规则 2: 按置信度排序（高置信度优先） ====
         signals = sorted(signals, key=lambda s: s.confidence, reverse=True)
 
         filtered = []
@@ -137,9 +178,7 @@ class RiskManager:
         for signal in signals:
             sym = signal.symbol
 
-            # ---- 规则 2: 单标的风控（仅针对买入信号）----
-            # 卖出信号不受单标的上限限制——确保能完全清仓
-            # B3: 考虑累计持仓——现有仓位 + 新信号不超过 max_single
+            # ---- 规则 3: 单标的风控（仅针对买入信号）----
             target_weight = signal.weight
             if signal.direction == 1:
                 current_sym_ratio = current_position_ratios.get(sym, 0) if current_position_ratios else 0
@@ -158,20 +197,18 @@ class RiskManager:
                         if target_weight <= 0:
                             continue
 
-            # ---- 规则 3: 每日符号数限制 ----
-            # 已有持仓的股票不受每日新开仓数量限制
+            # ---- 规则 4: 每日符号数限制 ----
             if sym not in existing_positions:
                 if len(symbols_today) >= max_symbols:
-                    continue  # 今日已开仓足够多的新股票
+                    continue
                 symbols_today.add(sym)
 
-            # ---- 规则 4: 总仓位上限（仅针对买入信号）----
-            # 卖出信号减少仓位，不受总仓位限制
+            # ---- 规则 5: 总仓位上限（仅针对买入信号）----
             if signal.direction == 1:
                 if used_ratio + target_weight > max_total:
                     target_weight = max_total - used_ratio
                     if target_weight <= 0:
-                        continue  # 无可用仓位
+                        continue
                 used_ratio += target_weight
 
             # 更新信号权重

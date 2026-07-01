@@ -84,6 +84,7 @@ class BacktestEngine:
         cfg = config or BACKTEST_CONFIG
         self.initial_capital = cfg['initial_capital']
         self.commission = cfg['commission']
+        self.commission_min = cfg.get('min_commission', 5.0)
         self.stamp_tax = cfg['stamp_tax']
         self.slippage = cfg['slippage']
 
@@ -169,13 +170,18 @@ class BacktestEngine:
             # ===== 买入 =====
             # 滑点：买在更高的价格
             execute_price = self.current_price * (1 + self.slippage)
+
             # 计算最大可买股数（含佣金：确保总花费不超过可用资金）
-            max_qty = int(self.capital * signal.weight / (execute_price * (1 + self.commission)))
+            max_qty_raw = self.capital * signal.weight / (execute_price * (1 + self.commission))
+            max_qty = int(max_qty_raw)
+            # A股最小交易单位=1手=100股
+            max_qty = (max_qty // 100) * 100
             if max_qty <= 0:
                 return
 
-            # 交易成本
-            cost = execute_price * max_qty * self.commission
+            # 交易成本（含最低5元佣金）
+            raw_comm = execute_price * max_qty * self.commission
+            cost = max(self.commission_min, raw_comm)
             total = execute_price * max_qty + cost
 
             if total <= self.capital:
@@ -193,11 +199,14 @@ class BacktestEngine:
             # 滑点：卖在更低的价格
             execute_price = self.current_price * (1 - self.slippage)
             sell_qty = int(self.position * signal.weight)
+            # A股最小交易单位=1手=100股
+            sell_qty = (sell_qty // 100) * 100
             if sell_qty <= 0:
                 return
 
-            # 卖出成本 = 佣金 + 印花税（A股卖出时收取）
-            cost = execute_price * sell_qty * self.commission
+            # 卖出成本 = 佣金（最低5元）+ 印花税（A股卖出时收取）
+            raw_comm = execute_price * sell_qty * self.commission
+            cost = max(self.commission_min, raw_comm)
             tax = execute_price * sell_qty * self.stamp_tax
             self.capital += execute_price * sell_qty - cost - tax
             self.position -= sell_qty

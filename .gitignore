@@ -9,3 +9,10 @@ data_storage/cache/
 .pytest_cache/
 C
 CLINE_LOG.md_temp
+
+# Ops Layer
+logs/
+data_storage/quant_trading.db
+config/.env
+config/*.json
+ops/_run_scheduled*.vbs
